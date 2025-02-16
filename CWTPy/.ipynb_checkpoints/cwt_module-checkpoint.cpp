@@ -316,27 +316,38 @@ py::tuple cwt_morlet_full(
 }
 
 //------------------------------------------------------------------------------
-// local_gaussian_mean
+// local_gaussian_mean (optimized)
+// Implements eqn(22) with normalization. For each scale s_i and time index n,
+// we compute:
+// 
+//    B_n(s_i) = [ Σ_{m in [lb, ub]} B_m * exp(- (t_n - t_m)^2/(2*lam^2*s_i^2)) ]
+//               / [ Σ_{m in [lb, ub]} exp(- (t_n - t_m)^2/(2*lam^2*s_i^2)) ]
+//
+// Instead of summing over all m, we only loop over indices m for which
+// |t_n - t_m| <= 3*lam*s_i.
+// We assume that the times array is sorted in ascending order.
+//
+// Returns an array of shape (S, N, D) (or (S, N) for 1D signals).
 //------------------------------------------------------------------------------
-/*
-   local_gaussian_mean:
-   Implements eqn(22) with a normalizing factor. For each scale s_i and time n,
-   we do:
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <cmath>
+#include <vector>
+#include <stdexcept>
+#include <algorithm>  // for std::lower_bound and std::upper_bound
 
-     B_n(s_i) = [ sum_{m=0..N-1} B_m exp(- (t_n - t_m)^2 / (2 lam^2 s_i^2)) ] /
-                [ sum_{m=0..N-1} exp(...) ]
+#ifdef _OPENMP
+  #include <omp.h>
+#endif
 
-   shape: signal => (N,D) or (N,), times => (N,), scales => (S,).
-   output => shape (S, N, D) or (S, N) if 1D.
+namespace py = pybind11;
 
-   We optionally parallelize over i (scales).
-*/
 py::array_t<double> local_gaussian_mean(
     py::array_t<double> signal,  // shape (N,) or (N,D)
     py::array_t<double> times,   // shape (N,)
     py::array_t<double> scales,  // shape (S,)
-    double lam,                  // dimensionless param
-    bool use_omp                 // if true => parallelize
+    double lam,                  // dimensionless parameter
+    bool use_omp                 // parallelize over scales if true
 ) {
     auto sig_buf   = signal.request();
     auto time_buf  = times.request();
@@ -344,14 +355,11 @@ py::array_t<double> local_gaussian_mean(
 
     int N = sig_buf.shape[0];
     int S = scale_buf.shape[0];
-    int D = 1;
-    if (sig_buf.ndim == 2){
-        D = sig_buf.shape[1];
-    } else if (sig_buf.ndim != 1){
+    int D = (sig_buf.ndim == 2) ? sig_buf.shape[1] : 1;
+    if (sig_buf.ndim != 1 && sig_buf.ndim != 2)
         throw std::runtime_error("signal must be 1D or 2D");
-    }
     if (time_buf.ndim != 1 || time_buf.shape[0] != N)
-        throw std::runtime_error("times must be 1D, length N");
+        throw std::runtime_error("times must be 1D with same length as signal");
     if (scale_buf.ndim != 1)
         throw std::runtime_error("scales must be 1D");
 
@@ -359,7 +367,10 @@ py::array_t<double> local_gaussian_mean(
     const double* time_ptr  = static_cast<const double*>(time_buf.ptr);
     const double* scale_ptr = static_cast<const double*>(scale_buf.ptr);
 
-    // output => shape (S,N,D)
+    // Copy times into a vector for binary search.
+    std::vector<double> times_vec(time_ptr, time_ptr + N);
+
+    // Output shape: (S, N, D)
     std::vector<py::ssize_t> out_shape = { S, N, D };
     py::array_t<double> B_out(out_shape);
     auto B_buf = B_out.request();
@@ -368,66 +379,110 @@ py::array_t<double> local_gaussian_mean(
 #ifdef _OPENMP
     if (use_omp) {
         #pragma omp parallel for schedule(dynamic)
-        for (int i=0; i<S; i++){
+        for (int i = 0; i < S; i++) {
             double s = scale_ptr[i];
-            double denom = 2.0*lam*lam*s*s;
-            for (int n=0; n<N; n++){
-                std::vector<double> accum(D, 0.0);
+            double sigma = lam * s;         // standard deviation
+            double delta = 3.0 * sigma;       // window = 3 sigma
+            for (int n = 0; n < N; n++) {
+                double tn = times_vec[n];
+                // Determine indices m that satisfy: tn - delta <= t_m <= tn + delta.
+                auto lb_it = std::lower_bound(times_vec.begin(), times_vec.end(), tn - delta);
+                auto ub_it = std::upper_bound(times_vec.begin(), times_vec.end(), tn + delta);
+                int lb = std::distance(times_vec.begin(), lb_it);
+                int ub = std::distance(times_vec.begin(), ub_it);
                 double sumW = 0.0;
-                double tn = time_ptr[n];
-                for (int m=0; m<N; m++){
-                    double dt = tn - time_ptr[m];
-                    double w = std::exp(-(dt*dt)/denom);
+                std::vector<double> accum(D, 0.0);
+                for (int m = lb; m < ub; m++) {
+                    double dt_val = tn - times_vec[m];
+                    double w = std::exp(- (dt_val * dt_val) / (2.0 * sigma * sigma));
                     sumW += w;
-                    if (D==1){
-                        accum[0] += sig_ptr[m]*w;
+                    if (D == 1) {
+                        accum[0] += sig_ptr[m] * w;
                     } else {
-                        for (int d=0; d<D; d++){
-                            accum[d] += sig_ptr[m*D + d]*w;
+                        for (int d = 0; d < D; d++) {
+                            accum[d] += sig_ptr[m * D + d] * w;
                         }
                     }
                 }
-                for (int d=0; d<D; d++){
+                // Normalize accum by the sum of weights.
+                for (int d = 0; d < D; d++) {
                     accum[d] /= (sumW + 1e-30);
-                }
-                for (int d=0; d<D; d++){
-                    B_ptr[((i*N)+n)*D + d] = accum[d];
+                    B_ptr[((i * N) + n) * D + d] = accum[d];
                 }
             }
         }
     } else
 #endif
     {
-        for (int i=0; i<S; i++){
+        for (int i = 0; i < S; i++) {
             double s = scale_ptr[i];
-            double denom = 2.0*lam*lam*s*s;
-            for (int n=0; n<N; n++){
-                std::vector<double> accum(D, 0.0);
+            double sigma = lam * s;
+            double delta = 3.0 * sigma;
+            for (int n = 0; n < N; n++) {
+                double tn = times_vec[n];
+                auto lb_it = std::lower_bound(times_vec.begin(), times_vec.end(), tn - delta);
+                auto ub_it = std::upper_bound(times_vec.begin(), times_vec.end(), tn + delta);
+                int lb = std::distance(times_vec.begin(), lb_it);
+                int ub = std::distance(times_vec.begin(), ub_it);
                 double sumW = 0.0;
-                double tn = time_ptr[n];
-                for (int m=0; m<N; m++){
-                    double dt = tn - time_ptr[m];
-                    double w = std::exp(-(dt*dt)/denom);
+                std::vector<double> accum(D, 0.0);
+                for (int m = lb; m < ub; m++) {
+                    double dt_val = tn - times_vec[m];
+                    double w = std::exp(- (dt_val * dt_val) / (2.0 * sigma * sigma));
                     sumW += w;
-                    if (D==1){
-                        accum[0] += sig_ptr[m]*w;
-                    } else {
-                        for (int d=0; d<D; d++){
-                            accum[d] += sig_ptr[m*D + d]*w;
+                    if (D == 1)
+                        accum[0] += sig_ptr[m] * w;
+                    else {
+                        for (int d = 0; d < D; d++) {
+                            accum[d] += sig_ptr[m * D + d] * w;
                         }
                     }
                 }
-                for (int d=0; d<D; d++){
+                for (int d = 0; d < D; d++) {
                     accum[d] /= (sumW + 1e-30);
-                }
-                for (int d=0; d<D; d++){
-                    B_ptr[((i*N)+n)*D + d] = accum[d];
+                    B_ptr[((i * N) + n) * D + d] = accum[d];
                 }
             }
         }
     }
 
     return B_out;
+}
+
+PYBIND11_MODULE(cwt_module, m) {
+    m.doc() = "CWTPy: final single-file library with Morlet CWT and optimized local Gaussian mean (eqn(22)) with 3σ-window optimization.";
+    m.def("cwt_morlet_full", &cwt_morlet_full,
+          py::arg("signal"),
+          py::arg("dt"),
+          py::arg("nv") = 32,
+          py::arg("omega0") = 6.0,
+          py::arg("min_freq") = 0.0,
+          py::arg("max_freq") = 0.0,
+          py::arg("use_omp") = false,
+          py::arg("norm_mult") = 1.0,
+          py::arg("consider_coi") = false,
+          py::arg("return_fft") = false,
+R"doc(
+Compute the Morlet continuous wavelet transform (CWT) of a real 1D signal.
+Returns a tuple:
+  (W, scales, wavelet_freqs, psd_factor, fft_freqs[, coi]).
+psd_factor = 4π/(C ω₀), where C is computed numerically.
+)doc");
+
+    m.def("local_gaussian_mean", &local_gaussian_mean,
+          py::arg("signal"),
+          py::arg("times"),
+          py::arg("scales"),
+          py::arg("lam") = 1.0,
+          py::arg("use_omp") = false,
+R"doc(
+Compute the local Gaussian mean of a signal (eqn(22)).
+For each scale s and time index n, compute:
+  B_n(s) = [ Σ_m B_m exp( - (t_n - t_m)^2/(2*lam^2*s^2) ) ] /
+           [ Σ_m exp( - (t_n - t_m)^2/(2*lam^2*s^2) ) ]
+Averages only over indices where |t_n - t_m| <= 3*lam*s.
+Returns an array of shape (S, N, D) for a D-component signal (or (S,N) for 1D).
+)doc");
 }
 
 //------------------------------------------------------------------------------
