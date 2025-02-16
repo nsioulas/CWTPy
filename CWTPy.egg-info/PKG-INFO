@@ -1,8 +1,8 @@
 Metadata-Version: 2.2
 Name: CWTPy
-Version: 0.1.0
+Version: 0.1.1
 Summary: A fast continuous wavelet transform (CWT) implementation using C++/FFTW/pybind11.
-Home-page: https://github.com/nsioulas/CWTPy
+Home-page: https://github.com/yourusername/CWTPy
 Author: Nikos Sioulas
 Author-email: nsioulas@berkeley.edu
 Classifier: Programming Language :: Python :: 3

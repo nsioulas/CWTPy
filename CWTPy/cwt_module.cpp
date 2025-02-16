@@ -80,9 +80,8 @@ py::tuple cwt_morlet_full(
     if (buf.ndim != 1)
         throw std::runtime_error("signal must be 1D");
     int N = buf.shape[0];
-    if (N < 2)
-        throw std::runtime_error("Signal too short.");
-    const double* sig_ptr = buf.ptr;
+    // Fix: explicitly cast buf.ptr to const double*
+    const double* sig_ptr = static_cast<const double*>(buf.ptr);
     double fs = 1.0 / dt;
     if (max_freq <= 0.0)
         max_freq = fs / 2.0;      // default to Nyquist.
