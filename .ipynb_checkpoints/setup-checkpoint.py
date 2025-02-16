@@ -45,11 +45,11 @@ module = Extension(
 
 setup(
     name="CWTPy",
-    version="0.1.0",
+    version="0.1.1",  # Update the version here
     description="A fast continuous wavelet transform (CWT) implementation using C++/FFTW/pybind11.",
     author="Nikos Sioulas",
     author_email="nsioulas@berkeley.edu",
-    url="https://github.com/nsioulas/CWTPy",  # update with your repo URL
+    url="https://github.com/yourusername/CWTPy",
     packages=find_packages(),
     ext_modules=[module],
     classifiers=[
@@ -59,3 +59,4 @@ setup(
     ],
     python_requires=">=3.6",
 )
+
