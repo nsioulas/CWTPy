@@ -69,15 +69,26 @@ static double compute_admissibility(double omega0) {
 //---------------------------------------------------------------------------------
 // 3) freq <-> scale mapping, eqn(12) in your references, including the correction factor
 //---------------------------------------------------------------------------------
+// static inline double freq_to_scale(double freq, double omega0) {
+//     if (freq <= 0.0)
+//         throw std::runtime_error("freq_to_scale: frequency must be > 0");
+//     double corr = 1.0 + 1.0/(2.0 * omega0 * omega0);
+//     return (omega0 / (2.0 * M_PI * freq)) * corr;
+// }
+// static inline double scale_to_freq(double s, double omega0) {
+//     double corr = 1.0 + 1.0/(2.0 * omega0 * omega0);
+//     return (omega0 / (2.0 * M_PI * s)) * corr;
+// }
+
 static inline double freq_to_scale(double freq, double omega0) {
     if (freq <= 0.0)
         throw std::runtime_error("freq_to_scale: frequency must be > 0");
-    double corr = 1.0 + 1.0/(2.0 * omega0 * omega0);
-    return (omega0 / (2.0 * M_PI * freq)) * corr;
+    // No correction factor
+    return (omega0 / (2.0 * M_PI * freq));
 }
+
 static inline double scale_to_freq(double s, double omega0) {
-    double corr = 1.0 + 1.0/(2.0 * omega0 * omega0);
-    return (omega0 / (2.0 * M_PI * s)) * corr;
+    return (omega0 / (2.0 * M_PI * s));
 }
 
 //---------------------------------------------------------------------------------
