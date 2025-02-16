@@ -1,4 +1,4 @@
-// cwt_module.cpp
+// CWTPy/cwt_module.cpp
 // CWTPy: A fast, cross‑platform CWT implementation using FFTW and OpenMP.
 // This module computes the continuous wavelet transform using an L2‑normalized
 // Morlet wavelet and returns the coefficients, scales, and frequencies.
@@ -6,19 +6,17 @@
 // Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
 
 #include <Python.h>    // Include full Python API first!
-
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <fftw3.h>
+#ifdef _OPENMP
+  #include <omp.h>
+#endif
 
 #include <vector>
 #include <complex>
 #include <cmath>
 #include <stdexcept>
-
-#ifdef _OPENMP
-  #include <omp.h>
-#endif
 
 namespace py = pybind11;
 
@@ -27,22 +25,22 @@ static inline double morlet_factor() {
     return std::pow(M_PI, -0.25);
 }
 
-// eqn(12): freq = (omega0/(2π s)) * (1 + 1/(2ω0^2)).
-// For now, we set correction factor to 1.0 (you can adjust as needed).
+// Convert scale to frequency, using eqn(12): freq = (omega0/(2π s)) * corr.
+// Here, we set corr = 1.0 (you can restore full correction if needed).
 static inline double scale_to_freq(double s, double omega0) {
-    double corr = 1.0;  // adjust if needed: 1.0 + 1.0/(2.0*omega0*omega0)
+    double corr = 1.0; // or (1.0 + 1.0/(2.0*omega0*omega0))
     return (omega0 / (2.0 * M_PI * s)) * corr;
 }
 
-// Inverted eqn(12): s = (omega0/(2π freq)) * (1 + 1/(2ω0^2)).
+// Inverse: frequency to scale.
 static inline double freq_to_scale(double freq, double omega0) {
     if (freq <= 0.0)
         throw std::runtime_error("freq_to_scale: frequency must be > 0");
-    double corr = 1.0;  // adjust if needed
+    double corr = 1.0;
     return (omega0 / (2.0 * M_PI * freq)) * corr;
 }
 
-// Build log-spaced scales from s0 -> s1 with factor a = 2^(1/nv) per octave.
+// Build log-spaced scales from s0 to s1 with multiplier a = 2^(1/nv) per octave.
 std::vector<double> make_scales_log(double s0, double s1, int nv) {
     if (s0 <= 0 || s1 <= s0)
         throw std::runtime_error("make_scales_log: invalid scale range");
@@ -56,15 +54,15 @@ std::vector<double> make_scales_log(double s0, double s1, int nv) {
 
 /*
    cwt_morlet_full:
-   ---------------
-   signal   : 1D real array.
-   dt       : sampling interval.
-   nv       : voices per octave.
-   omega0   : Morlet wavelet parameter.
+   ----------------
+   signal   : real 1D array
+   dt       : sampling interval
+   nv       : voices per octave
+   omega0   : Morlet parameter
    min_freq, max_freq:
-              if <= 0, use defaults: [1/(N*dt), fs/2].
+              if <= 0, use defaults: [1/(N*dt), fs/2]
    use_omp  : if true, parallelize over scales using OpenMP.
-   Returns a tuple (W, scales, freqs).
+   Returns a tuple (W, scales, freqs)
 */
 py::tuple cwt_morlet_full(
     py::array_t<double> signal,
@@ -75,18 +73,19 @@ py::tuple cwt_morlet_full(
     double max_freq,
     bool use_omp
 ) {
-    // 1) Parse input and define frequency range.
+    // 1) Parse input and set frequency bounds.
     auto buf = signal.request();
     if (buf.ndim != 1)
         throw std::runtime_error("signal must be 1D");
     int N = buf.shape[0];
-    // Fix: explicitly cast buf.ptr to const double*
+    if (N < 2)
+        throw std::runtime_error("Signal too short.");
     const double* sig_ptr = static_cast<const double*>(buf.ptr);
     double fs = 1.0 / dt;
     if (max_freq <= 0.0)
-        max_freq = fs / 2.0;      // default to Nyquist.
+        max_freq = fs / 2.0;  // default: Nyquist.
     if (min_freq <= 0.0)
-        min_freq = 1.0 / (N * dt); // default to lowest resolvable.
+        min_freq = 1.0 / (N * dt);  // default: lowest resolvable.
     if (min_freq >= max_freq)
         throw std::runtime_error("min_freq >= max_freq => invalid range.");
 
@@ -115,8 +114,9 @@ py::tuple cwt_morlet_full(
     }
     fftw_free(out);
 
-    // 3) Prepare output container for coefficients.
+    // 3) Prepare output array for coefficients.
     std::vector<std::complex<double>> W_data(num_scales * N);
+
     // Build an angular frequency array.
     std::vector<double> omega_vec(N);
     double df = fs / double(N);
@@ -124,24 +124,26 @@ py::tuple cwt_morlet_full(
         double f_k = (k <= N/2) ? k * df : -(N - k) * df;
         omega_vec[k] = 2.0 * M_PI * f_k;
     }
-    double norm = morlet_factor(); // normalization constant.
+    double norm = morlet_factor();
 
     // 4) Compute inverse FFT for each scale.
-    // If OpenMP is enabled, use a parallel loop.
+    // If using OpenMP, call fftw_init_threads() once.
 #ifdef _OPENMP
     if (use_omp) {
-        // Initialize FFTW threading once.
-        fftw_init_threads();
+        if (!fftw_init_threads()) {
+            throw std::runtime_error("Failed to initialize FFTW threads.");
+        }
+        // Parallelize over scales with static scheduling.
         #pragma omp parallel
         {
-            // Each thread uses one thread for its own FFTW plan.
+            // Each thread sets its own thread count for FFTW (force single-threaded plan per thread).
             fftw_plan_with_nthreads(1);
-            // Allocate thread-local buffers.
             fftw_complex* freq_prod_local = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
-            fftw_complex* inv_local       = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
+            fftw_complex* inv_local = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
+            // Create a single backward FFT plan per thread (reuse it for all scales processed by this thread).
             fftw_plan plan_bwd_local = fftw_plan_dft_1d(N, freq_prod_local, inv_local, FFTW_BACKWARD, FFTW_ESTIMATE);
 
-            #pragma omp for schedule(dynamic)
+            #pragma omp for schedule(static)
             for (int sidx = 0; sidx < num_scales; sidx++) {
                 double s = scales[sidx];
                 for (int k = 0; k < N; k++) {
@@ -155,19 +157,19 @@ py::tuple cwt_morlet_full(
                 for (int n = 0; n < N; n++) {
                     double re = inv_local[n][0] / double(N);
                     double im = inv_local[n][1] / double(N);
-                    W_data[sidx * N + n] = std::complex<double>(re, im);
+                    W_data[sidx * N + n] = { re, im };
                 }
             }
             fftw_destroy_plan(plan_bwd_local);
             fftw_free(freq_prod_local);
             fftw_free(inv_local);
-        } // end OpenMP region
+        }
     } else
 #endif
     {
         // Single-threaded version.
         fftw_complex* freq_prod = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
-        fftw_complex* inv       = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
+        fftw_complex* inv = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
         fftw_plan plan_bwd = fftw_plan_dft_1d(N, freq_prod, inv, FFTW_BACKWARD, FFTW_ESTIMATE);
         for (int sidx = 0; sidx < num_scales; sidx++) {
             double s = scales[sidx];
@@ -182,7 +184,7 @@ py::tuple cwt_morlet_full(
             for (int n = 0; n < N; n++) {
                 double re = inv[n][0] / double(N);
                 double im = inv[n][1] / double(N);
-                W_data[sidx * N + n] = std::complex<double>(re, im);
+                W_data[sidx * N + n] = { re, im };
             }
         }
         fftw_destroy_plan(plan_bwd);
@@ -190,13 +192,13 @@ py::tuple cwt_morlet_full(
         fftw_free(inv);
     }
 
-    // 5) Build frequency array corresponding to scales.
+    // 5) Build the frequency array corresponding to each scale.
     std::vector<double> freqs(num_scales);
     for (int i = 0; i < num_scales; i++) {
         freqs[i] = scale_to_freq(scales[i], omega0);
     }
 
-    // 6) Convert data to Python objects.
+    // 6) Convert the result to Python objects.
     py::array_t<std::complex<double>> W_py({ num_scales, N });
     {
         auto W_buf = W_py.request();
@@ -208,8 +210,8 @@ py::tuple cwt_morlet_full(
     {
         auto s_buf = scales_py.request();
         auto f_buf = freqs_py.request();
-        double* s_ptr = (double*)s_buf.ptr;
-        double* f_ptr = (double*)f_buf.ptr;
+        double* s_ptr = (double*) s_buf.ptr;
+        double* f_ptr = (double*) f_buf.ptr;
         for (int i = 0; i < num_scales; i++) {
             s_ptr[i] = scales[i];
             f_ptr[i] = freqs[i];
@@ -220,7 +222,7 @@ py::tuple cwt_morlet_full(
 }
 
 PYBIND11_MODULE(cwt_module, m) {
-    m.doc() = "Faster Morlet CWT with OpenMP parallelization using per-thread inverse FFT plans";
+    m.doc() = "Faster Morlet CWT with per-thread iFFT plans and static scheduling in OpenMP";
     m.def("cwt_morlet_full", &cwt_morlet_full,
           py::arg("signal"),
           py::arg("dt"),
@@ -252,9 +254,9 @@ use_omp : bool, optional
 Returns
 -------
 tuple
-    A tuple (W, scales, freqs) where:
-        W      : np.ndarray of shape (num_scales, N) with CWT coefficients.
-        scales : 1D array of scales.
-        freqs  : 1D array of frequencies corresponding to each scale.
+    (W, scales, freqs) where:
+      - W      : np.ndarray of shape (num_scales, N) with CWT coefficients.
+      - scales : 1D array of scales.
+      - freqs  : 1D array of frequencies corresponding to each scale.
 )doc");
 }

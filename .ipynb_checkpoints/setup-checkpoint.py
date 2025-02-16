@@ -36,7 +36,7 @@ module = Extension(
     "CWTPy.cwt_module",
     sources=["CWTPy/cwt_module.cpp"],
     include_dirs=[pybind11.get_include(), fftw_inc],
-    libraries=["fftw3"],
+    libraries=["fftw3", "fftw3_threads"],
     library_dirs=[fftw_lib],
     extra_compile_args=extra_compile_args,  # Note: removed -DPy_LIMITED_API=0x03060000
     extra_link_args=extra_link_args,
