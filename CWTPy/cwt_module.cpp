@@ -1,22 +1,25 @@
-
 // CWTPy/cwt_module.cpp
-// CWTPy: A fast, cross‑platform continuous wavelet transform (CWT) library
-// using FFTW and OpenMP.
-// This module computes the CWT using an L2‐normalized Morlet wavelet.
-// It returns the coefficients, scales, frequencies, and a PSD normalization factor.
+// CWTPy: A fast, cross‑platform continuous wavelet transform (CWT) implementation
+// using FFTW and optional OpenMP with self-consistent normalization and COI.
+// This module computes the CWT using an L2‑normalized Morlet wavelet and returns:
+//    - W: CWT coefficients (num_scales x N)
+//    - scales: array of scales
+//    - freqs: wavelet-mapped frequencies (Hz)
+//    - psd_norm: normalization factor for converting power to a PSD
+//    - (optionally) coi: cone of influence, a 1D array of length N
+//    - (optionally) fft_freqs: FFT frequencies of the input signal (Hz)
+// 
 // The PSD normalization factor is computed as:
-//    psd_norm = (4π dt) / (C ω₀ T),
-// where T = N*dt and C is the admissibility constant, defined by
-//    C = (1/√π) ∫₀∞ exp[–(ω – ω₀)²] / ω dω.
-// For ω₀=6, typical C ≈ 0.776 (may vary slightly with integration parameters).
-//
+//    psd_norm = (4π dt)/(C ω₀ T),  where T = N·dt, and C is the admissibility constant:
+//    C = (1/√π) ∫₀∞ exp[–(ω – ω₀)²] / ω dω, numerically computed.
+// For ω₀=6, typical C ≈ 0.776.
+// 
 // Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
 
-#include <Python.h>    // Full Python API must be included first!
+#include <Python.h>    // Must be included first!
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <fftw3.h>
-
 #ifdef _OPENMP
   #include <omp.h>
 #endif
@@ -25,27 +28,26 @@
 #include <complex>
 #include <cmath>
 #include <stdexcept>
+#include <algorithm>
 
 namespace py = pybind11;
 
 // ---------------------------------------------------------------------
-// Morlet normalization factor: ψ(t) = π^(–1/4) exp(i ω₀ t) exp(–t²/2)
-// so that ∫|ψ(t)|² dt = 1.
+// Morlet normalization factor (for L2 normalization of ψ)
 // ---------------------------------------------------------------------
 static inline double morlet_factor() {
     return std::pow(M_PI, -0.25);
 }
 
 // ---------------------------------------------------------------------
-// Compute the admissibility constant C for the Morlet wavelet.
-// We use Simpson's rule to approximate:
-//    C = (1/√π) ∫₀∞ exp[–(ω – ω₀)²] / ω dω
-// For ω₀ = 6, this should be close to 0.776.
+// Compute the admissibility constant C for the Morlet wavelet using Simpson's rule.
+//   C = (1/√π) ∫₀∞ exp[–(ω – ω₀)²] / ω dω
+// For ω₀=6, C is approximately 0.776.
 // ---------------------------------------------------------------------
 static double compute_admissibility(double omega0) {
     const double eps = 1e-6;
-    double upper = omega0 + 10.0;  // upper limit where the integrand is negligible.
-    const int nsteps = 100000;     // even number for Simpson's rule.
+    double upper = omega0 + 10.0;  // integration upper limit
+    const int nsteps = 100000;     // must be even
     double h = (upper - eps) / nsteps;
     double sum = 0.0;
     for (int i = 0; i <= nsteps; i++) {
@@ -63,22 +65,22 @@ static double compute_admissibility(double omega0) {
 }
 
 // ---------------------------------------------------------------------
-// Convert frequency to scale using the relation:
-//    freq = (omega0/(2π s)) * (1 + 1/(2ω0²))
-// So, s = (omega0/(2π freq)) * (1 + 1/(2ω0²))
+// Frequency-to-scale mapping (inversion of scale_to_freq).
+// Using the relation:
+//   freq = (omega0/(2π s))*(1+1/(2ω₀²))  =>  s = (omega0/(2π freq))*(1+1/(2ω₀²))
 // ---------------------------------------------------------------------
 static inline double freq_to_scale(double freq, double omega0) {
     if (freq <= 0.0)
         throw std::runtime_error("freq_to_scale: frequency must be > 0");
-    double corr = 1.0 + 1.0/(2.0 * omega0 * omega0);
+    double corr = 1.0 + 1.0 / (2.0 * omega0 * omega0);
     return (omega0 / (2.0 * M_PI * freq)) * corr;
 }
 
 // ---------------------------------------------------------------------
-// Convert scale to frequency (inverse relation).
+// Scale-to-frequency mapping.
 // ---------------------------------------------------------------------
 static inline double scale_to_freq(double s, double omega0) {
-    double corr = 1.0 + 1.0/(2.0 * omega0 * omega0);
+    double corr = 1.0 + 1.0 / (2.0 * omega0 * omega0);
     return (omega0 / (2.0 * M_PI * s)) * corr;
 }
 
@@ -96,30 +98,59 @@ static std::vector<double> make_scales_log(double s0, double s1, int nv) {
     return scales;
 }
 
+// ---------------------------------------------------------------------
+// Compute the Cone of Influence (COI) for a time series of length N and sampling interval dt.
+// COI(t) = dt * sqrt(2) * min(t+1, N - t)
+// (Here t is the index, starting from 0.)
+static std::vector<double> compute_coi(int N, double dt) {
+    std::vector<double> coi(N);
+    for (int t = 0; t < N; t++) {
+        double d = std::min(double(t + 1), double(N - t));
+        coi[t] = dt * std::sqrt(2.0) * d;
+    }
+    return coi;
+}
+
+// ---------------------------------------------------------------------
+// Compute the FFT frequencies (in Hz) for a time series of length N with sampling frequency fs.
+// Uses the standard FFT frequency ordering.
+static std::vector<double> compute_fft_freqs(int N, double fs) {
+    std::vector<double> fft_freqs(N);
+    double df = fs / double(N);
+    for (int k = 0; k < N; k++) {
+        if (k <= N / 2)
+            fft_freqs[k] = k * df;
+        else
+            fft_freqs[k] = -(N - k) * df;
+    }
+    return fft_freqs;
+}
+
 /*
    cwt_morlet_full:
    ----------------
-   Computes the continuous wavelet transform (CWT) of a real 1D signal
-   using an L2-normalized Morlet wavelet.
-
+   Compute the continuous wavelet transform (CWT) of a real 1D signal using an L2-normalized Morlet wavelet.
+   
    Parameters:
        signal    : 1D numpy array (real input signal)
        dt        : Sampling interval (seconds)
        nv        : Voices per octave
-       omega0    : Morlet wavelet parameter (e.g., 6.0)
-       min_freq  : Minimum frequency (Hz); if <=0, defaults to 1/(N*dt)
-       max_freq  : Maximum frequency (Hz); if <=0, defaults to fs/2
+       omega0    : Morlet wavelet parameter (e.g., 6)
+       min_freq  : Minimum frequency (Hz); if <= 0, defaults to 1/(N*dt)
+       max_freq  : Maximum frequency (Hz); if <= 0, defaults to fs/2
        use_omp   : If true, parallelize over scales using OpenMP
-       norm_mult : Multiplier applied to the normalization constant (default 1.0)
-                  Use this to fine-tune the overall amplitude for PSD comparisons.
-
+       norm_mult : Multiplier for the wavelet normalization (default 1.0)
+       return_coi: If true, return the cone of influence (COI) as a 1D array (length N)
+       return_fft_freqs: If true, return the FFT frequencies (Hz) as a 1D array (length N)
+   
    Returns:
-       A tuple (W, scales, freqs, psd_norm) where:
-         - W       : 2D numpy array of shape (num_scales, N) with CWT coefficients.
-         - scales  : 1D array of scales.
-         - freqs   : 1D array of frequencies corresponding to each scale.
-         - psd_norm: Normalization factor for converting wavelet power to a PSD,
-                     computed as (4π dt)/(C ω0 T) where T=N*dt and C is the admissibility constant.
+       A tuple containing:
+         - W       : 2D numpy array (num_scales x N) of CWT coefficients
+         - scales  : 1D array of scales used
+         - freqs   : 1D array of wavelet frequencies corresponding to each scale (Hz)
+         - psd_norm: PSD normalization factor: (4π dt)/(C ω0 T), with T = N*dt and C the admissibility constant
+         - (optional) coi: 1D array of cone-of-influence values (if return_coi is true)
+         - (optional) fft_freqs: 1D array of FFT frequencies (Hz) of the input signal (if return_fft_freqs is true)
 */
 py::tuple cwt_morlet_full(
     py::array_t<double> signal,
@@ -129,9 +160,11 @@ py::tuple cwt_morlet_full(
     double min_freq,
     double max_freq,
     bool use_omp,
-    double norm_mult = 1.0
+    double norm_mult = 1.0,
+    bool return_coi = false,
+    bool return_fft_freqs = false
 ) {
-    // 1) Parse input and define frequency bounds.
+    // 1) Parse input and determine frequency bounds.
     auto buf = signal.request();
     if (buf.ndim != 1)
         throw std::runtime_error("signal must be 1D");
@@ -147,15 +180,15 @@ py::tuple cwt_morlet_full(
     if (min_freq >= max_freq)
         throw std::runtime_error("min_freq >= max_freq => invalid range.");
 
-    // Convert frequency bounds to scales.
-    double smin = freq_to_scale(max_freq, omega0); // smallest scale.
-    double smax = freq_to_scale(min_freq, omega0); // largest scale.
+    // 2) Map frequency bounds to scales.
+    double smin = freq_to_scale(max_freq, omega0); // smallest scale
+    double smax = freq_to_scale(min_freq, omega0); // largest scale
     if (smin >= smax)
         throw std::runtime_error("Scale range is invalid. Check frequency bounds.");
     std::vector<double> scales = make_scales_log(smin, smax, nv);
     int num_scales = static_cast<int>(scales.size());
 
-    // 2) Compute forward FFT of the signal.
+    // 3) Compute forward FFT.
     fftw_complex* in  = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
     fftw_complex* out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
     for (int i = 0; i < N; i++) {
@@ -168,21 +201,23 @@ py::tuple cwt_morlet_full(
     fftw_free(in);
     std::vector<std::complex<double>> sig_fft(N);
     for (int i = 0; i < N; i++) {
-        sig_fft[i] = { out[i][0], out[i][1] };
+        sig_fft[i] = std::complex<double>(out[i][0], out[i][1]);
     }
     fftw_free(out);
 
-    // 3) Prepare output container.
+    // 4) Prepare output container for CWT coefficients.
     std::vector<std::complex<double>> W_data(num_scales * N);
+
+    // Build an angular frequency array.
     std::vector<double> omega_vec(N);
     double df = fs / double(N);
     for (int k = 0; k < N; k++) {
-        double f_k = (k <= N / 2) ? k * df : -(N - k) * df;
+        double f_k = (k <= N/2) ? k * df : -(N - k) * df;
         omega_vec[k] = 2.0 * M_PI * f_k;
     }
     double norm = morlet_factor() * norm_mult;
 
-    // 4) Compute inverse FFT for each scale.
+    // 5) Compute inverse FFT for each scale.
 #ifdef _OPENMP
     if (use_omp) {
         if (!fftw_init_threads()) {
@@ -242,22 +277,22 @@ py::tuple cwt_morlet_full(
         fftw_free(inv);
     }
 
-    // 5) Build frequency array from scales.
+    // 6) Build frequency array for wavelet transform (Hz).
     std::vector<double> freq_arr(num_scales);
     for (int i = 0; i < num_scales; i++) {
         freq_arr[i] = scale_to_freq(scales[i], omega0);
     }
 
-    // 6) Compute the PSD normalization factor.
+    // 7) Compute the PSD normalization factor.
     double T = N * dt;
     double C_val = compute_admissibility(omega0);
     double psd_norm = (4.0 * M_PI * dt) / (C_val * omega0 * T);
 
-    // 7) Convert results to Python arrays.
+    // 8) Convert results to Python arrays.
     py::array_t<std::complex<double>> W_py({ num_scales, N });
     {
         auto W_buf = W_py.request();
-        auto* W_ptr = (std::complex<double>*)W_buf.ptr;
+        auto* W_ptr = (std::complex<double>*) W_buf.ptr;
         std::memcpy(W_ptr, W_data.data(), num_scales * N * sizeof(std::complex<double>));
     }
     py::array_t<double> scales_py(num_scales);
@@ -273,12 +308,47 @@ py::tuple cwt_morlet_full(
         }
     }
 
-    // Return (W, scales, freqs, psd_norm)
-    return py::make_tuple(W_py, scales_py, freqs_py, psd_norm);
+    // 9) Optionally compute and return the cone of influence.
+    py::object py_coi = py::none();
+    if (return_coi) {
+        std::vector<double> coi = compute_coi(N, dt);
+        py::array_t<double> coi_py(N);
+        auto coi_buf = coi_py.request();
+        double* coi_ptr = (double*) coi_buf.ptr;
+        for (int i = 0; i < N; i++) {
+            coi_ptr[i] = coi[i];
+        }
+        py_coi = coi_py;
+    }
+
+    // 10) Optionally compute and return FFT frequencies (in Hz).
+    py::object py_fft_freqs = py::none();
+    if (return_fft_freqs) {
+        std::vector<double> fft_freqs = compute_fft_freqs(N, fs);
+        py::array_t<double> fft_freqs_py(N);
+        auto fft_buf = fft_freqs_py.request();
+        double* fft_ptr = (double*) fft_buf.ptr;
+        for (int i = 0; i < N; i++) {
+            fft_ptr[i] = fft_freqs[i];
+        }
+        py_fft_freqs = fft_freqs_py;
+    }
+
+    // 11) Build the tuple to return.
+    // Depending on return_coi and return_fft_freqs, return 4, 5, or 6 items.
+    if (return_coi && return_fft_freqs) {
+        return py::make_tuple(W_py, scales_py, freqs_py, psd_norm, py_coi, py_fft_freqs);
+    } else if (return_coi) {
+        return py::make_tuple(W_py, scales_py, freqs_py, psd_norm, py_coi);
+    } else if (return_fft_freqs) {
+        return py::make_tuple(W_py, scales_py, freqs_py, psd_norm, py_fft_freqs);
+    } else {
+        return py::make_tuple(W_py, scales_py, freqs_py, psd_norm);
+    }
 }
 
 PYBIND11_MODULE(cwt_module, m) {
-    m.doc() = "CWTPy: A fast Morlet CWT using FFTW with self-consistent normalization and optional OpenMP.";
+    m.doc() = "CWTPy: A fast Morlet CWT with self-consistent normalization, COI, and FFT frequencies.";
     m.def("cwt_morlet_full", &cwt_morlet_full,
           py::arg("signal"),
           py::arg("dt"),
@@ -288,6 +358,8 @@ PYBIND11_MODULE(cwt_module, m) {
           py::arg("max_freq") = 0.0,
           py::arg("use_omp") = false,
           py::arg("norm_mult") = 1.0,
+          py::arg("return_coi") = true,
+          py::arg("return_fft_freqs") = true,
 R"doc(
 Compute the Morlet continuous wavelet transform (CWT) of a real 1D signal.
 
@@ -309,15 +381,27 @@ use_omp : bool, optional
     If True, parallelize the transform over scales using OpenMP.
 norm_mult : float, optional
     A multiplier applied to the normalization constant (default=1.0).
+return_coi : bool, optional
+    If True, return the cone of influence (COI) as a 1D array (length N).
+return_fft_freqs : bool, optional
+    If True, return the FFT frequencies (Hz) of the input signal as a 1D array.
 
 Returns
 -------
 tuple
-    (W, scales, freqs, psd_norm) where:
-      - W      : np.ndarray of shape (num_scales, N) with CWT coefficients.
-      - scales : 1D array of scales.
-      - freqs  : 1D array of frequencies corresponding to each scale.
-      - psd_norm : Normalization factor for converting wavelet power to a PSD:
-                   psd_norm = (4π dt) / (C ω0 T), where T = N*dt and C is the admissibility constant.
+    Depending on the flags, returns:
+      - (W, scales, freqs, psd_norm)
+      - (W, scales, freqs, psd_norm, coi)
+      - (W, scales, freqs, psd_norm, fft_freqs)
+      - (W, scales, freqs, psd_norm, coi, fft_freqs)
+
+    where:
+      - W       : np.ndarray of shape (num_scales, N) with CWT coefficients.
+      - scales  : 1D array of scales.
+      - freqs   : 1D array of wavelet frequencies (Hz) corresponding to each scale.
+      - psd_norm: Normalization factor for converting wavelet power to a PSD:
+                  psd_norm = (4π dt)/(C ω0 T), with T = N·dt and C computed numerically.
+      - coi     : (optional) 1D array of cone-of-influence values (seconds).
+      - fft_freqs: (optional) 1D array of FFT frequencies (Hz) for the input signal.
 )doc");
 }
