@@ -1,1 +1,3 @@
 include CWTPy/cwt_module.cpp
+include README.md
+include LICENSE

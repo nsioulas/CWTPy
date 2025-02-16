@@ -1,0 +1,9 @@
+MANIFEST.in
+README.md
+setup.py
+CWTPy/__init__.py
+CWTPy/cwt_module.cpp
+CWTPy.egg-info/PKG-INFO
+CWTPy.egg-info/SOURCES.txt
+CWTPy.egg-info/dependency_links.txt
+CWTPy.egg-info/top_level.txt
