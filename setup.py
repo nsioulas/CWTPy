@@ -56,7 +56,7 @@ module = Extension(
 
 setup(
     name="CWTPy",
-    version="0.3.0",  # Update the version here
+    version="0.3.1",  # Update the version here
     description="A fast continuous wavelet transform (CWT) implementation using C++/FFTW/pybind11.",
     author="Nikos Sioulas",
     author_email="nsioulas@berkeley.edu",

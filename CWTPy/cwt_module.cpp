@@ -1,23 +1,15 @@
 // CWTPy/cwt_module.cpp
 // CWTPy: A single unified C++ module for:
 //   1) cwt_morlet_full  : Morlet wavelet continuous wavelet transform (CWT)
-//   2) local_gaussian_mean : Local Gaussian mean (Equation (22)) with normalization
+//   2) local_gaussian_mean : Local Gaussian mean (eqn(22)) with normalization
 //
-// This version supports user-specified scale distributions via a new parameter "scale_type".
-// Supported options include:
-//   - "log": Exponentially spaced scales.
-//   - "log-piecewise": Log spacing with downsampling at high scales.
-//   - "linear": Linearly spaced scales.
-// It uses FFTW_MEASURE for optimized planning and pre-creates FFTW backward plans (serially)
-// before executing them concurrently with OpenMP. The inner loop over frequency bins is annotated
-// with OpenMP SIMD hints to encourage vectorization.
-//
-// IMPORTANT: To use FFTW's OpenMP routines, compile and link against the FFTW OpenMP library (e.g. fftw3_omp).
-// On macOS, ensure FFTW is installed with OpenMP support (via Homebrew) and update your setup.py accordingly.
-//
+// This version uses FFTW_MEASURE for planning, precomputes invariants for each scale,
+// and uses OpenMP SIMD hints on the inner loop to encourage vectorization.
+// It does not change the final numerical results.
+// 
 // Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
 
-#include <Python.h>    // Must be included first!
+#include <Python.h>  // Must be included first!
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <fftw3.h>
@@ -31,33 +23,8 @@
 #include <cmath>
 #include <stdexcept>
 #include <algorithm>
-#include <string>
 
 namespace py = pybind11;
-
-//------------------------------------------------------------------------------
-// Helper functions: compute_fft_freqs and compute_coi
-//------------------------------------------------------------------------------
-static std::vector<double> compute_fft_freqs(int N, double fs) {
-    std::vector<double> fft_freqs(N);
-    double df = fs / double(N);
-    for (int k = 0; k < N; k++){
-        if (k <= N/2)
-            fft_freqs[k] = k * df;
-        else
-            fft_freqs[k] = -(N - k) * df;
-    }
-    return fft_freqs;
-}
-
-static std::vector<double> compute_coi(int N, double dt) {
-    std::vector<double> coi(N);
-    for (int t = 0; t < N; t++) {
-        double d = std::min(double(t+1), double(N-t));
-        coi[t] = dt * std::sqrt(2.0) * d;
-    }
-    return coi;
-}
 
 //------------------------------------------------------------------------------
 // 1) Morlet wavelet helpers
@@ -101,41 +68,32 @@ static inline double scale_to_freq(double s, double omega0) {
 static std::vector<double> make_scales_log(double s0, double s1, int nv) {
     if (s0 <= 0 || s1 <= s0)
         throw std::runtime_error("make_scales_log: invalid scale range");
-    double a = std::pow(2.0, 1.0/double(nv));
+    double a = std::pow(2.0, 1.0 / double(nv));
     std::vector<double> scales;
     for (double s = s0; s <= s1; s *= a)
         scales.push_back(s);
     return scales;
 }
 
-// Generate scales based on a preset string.
-static std::vector<double> generate_scales(double s0, double s1, int nv, const std::string &scale_type) {
-    if (scale_type == "log") {
-        return make_scales_log(s0, s1, nv);
-    } else if (scale_type == "log-piecewise") {
-        std::vector<double> scales = make_scales_log(s0, s1, nv);
-        double threshold = 1.05;  // if consecutive scales have ratio < threshold, skip
-        std::vector<double> filtered;
-        filtered.push_back(scales[0]);
-        for (size_t i = 1; i < scales.size(); i++) {
-            if (scales[i] / filtered.back() > threshold)
-                filtered.push_back(scales[i]);
-        }
-        return filtered;
-    } else if (scale_type == "linear") {
-        // Create a fixed number of linearly spaced scales.
-        double octaves = std::log2(s1 / s0);
-        int count = std::max(2, (int)std::ceil(octaves * nv));
-        std::vector<double> scales(count);
-        double step = (s1 - s0) / (count - 1);
-        for (int i = 0; i < count; i++) {
-            scales[i] = s0 + i * step;
-        }
-        return scales;
-    } else {
-        // Default to log-piecewise.
-        return make_scales_log(s0, s1, nv);
+static std::vector<double> compute_coi(int N, double dt) {
+    std::vector<double> coi(N);
+    for (int t = 0; t < N; t++) {
+        double d = std::min(double(t+1), double(N-t));
+        coi[t] = dt * std::sqrt(2.0) * d;
     }
+    return coi;
+}
+
+static std::vector<double> compute_fft_freqs(int N, double fs) {
+    std::vector<double> fft_freqs(N);
+    double df = fs / double(N);
+    for (int k = 0; k < N; k++){
+        if (k <= N/2)
+            fft_freqs[k] = k * df;
+        else
+            fft_freqs[k] = -(N-k) * df;
+    }
+    return fft_freqs;
 }
 
 //------------------------------------------------------------------------------
@@ -147,16 +105,12 @@ static std::vector<double> generate_scales(double s0, double s1, int nv, const s
    Returns a tuple:
      (W, scales, wave_freqs, psd_factor, fft_freqs[, coi])
    where:
-     - W is the array of CWT coefficients (num_scales x N),
-     - scales is the vector of scales (in seconds),
-     - wave_freqs are the corresponding wavelet frequencies (Hz),
-     - psd_factor = 4π/(C ω₀), computed via Simpson's rule,
-     - fft_freqs are the FFT frequencies (Hz),
-     - coi is the cone-of-influence (if requested).
-     
-   New parameter:
-     scale_type: string specifying scale distribution. Options: "log", "log-piecewise", "linear".
-     Default is "log-piecewise".
+     - W: CWT coefficients (num_scales x N)
+     - scales: vector of scales (in seconds)
+     - wave_freqs: corresponding wavelet frequencies (Hz)
+     - psd_factor = 4π/(C ω₀) (C computed numerically)
+     - fft_freqs: FFT frequencies (Hz)
+     - coi: cone-of-influence (if requested)
 */
 py::tuple cwt_morlet_full(
     py::array_t<double> signal,
@@ -167,7 +121,6 @@ py::tuple cwt_morlet_full(
     double max_freq,
     bool use_omp,
     double norm_mult,
-    const std::string &scale_type,
     bool consider_coi,
     bool return_fft
 ) {
@@ -188,24 +141,24 @@ py::tuple cwt_morlet_full(
         throw std::runtime_error("Signal too short");
     const double* sig_ptr = static_cast<const double*>(buf.ptr);
 
-    double fs = 1.0/dt;
+    double fs = 1.0 / dt;
     if (max_freq <= 0.0)
-        max_freq = fs/2.0;
+        max_freq = fs / 2.0;
     if (min_freq <= 0.0)
-        min_freq = 1.0/(N*dt);
+        min_freq = 1.0 / (N * dt);
     if (min_freq >= max_freq)
         throw std::runtime_error("min_freq >= max_freq => invalid range");
 
-    double smin = freq_to_scale(max_freq, omega0);  // smallest scale
-    double smax = freq_to_scale(min_freq, omega0);    // largest scale
+    double smin = freq_to_scale(max_freq, omega0);
+    double smax = freq_to_scale(min_freq, omega0);
     if (smin >= smax)
         throw std::runtime_error("Scale range is invalid. Check freq bounds.");
-    std::vector<double> scales = generate_scales(smin, smax, nv, scale_type);
+    std::vector<double> scales = make_scales_log(smin, smax, nv);
     int num_scales = static_cast<int>(scales.size());
 
     // Forward FFT.
-    fftw_complex* in  = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
-    fftw_complex* out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
+    fftw_complex* in  = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*N);
+    fftw_complex* out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*N);
     for (int i = 0; i < N; i++){
         in[i][0] = sig_ptr[i];
         in[i][1] = 0.0;
@@ -249,10 +202,14 @@ py::tuple cwt_morlet_full(
     for (int sidx = 0; sidx < num_scales; sidx++){
         double s = scales[sidx];
         double sqrt_s = std::sqrt(s); // precompute √s
+        // Inner loop: vectorize this loop.
+        #pragma omp simd
         for (int k = 0; k < N; k++){
             double arg = s * omega_vec[k] - omega0;
-            double wavelet = std::exp(-0.5 * arg * arg) * sqrt_s * norm;
+            double exp_val = std::exp(-0.5 * arg * arg);
+            double wavelet = exp_val * sqrt_s * norm;
             std::complex<double> val = sig_fft[k] * wavelet;
+            // Store results in the frequency-domain buffer.
             freq_prods[sidx][k][0] = val.real();
             freq_prods[sidx][k][1] = val.imag();
         }
@@ -445,7 +402,7 @@ py::array_t<double> local_gaussian_mean(
 }
 
 PYBIND11_MODULE(cwt_module, m) {
-    m.doc() = "CWTPy: final single-file library with Morlet CWT and local Gaussian mean, supporting user-specified scale distribution.";
+    m.doc() = "CWTPy: final single-file library with Morlet CWT and local Gaussian mean, using pre-created FFTW OpenMP plans and inner-loop vectorization.";
     
     m.def("cwt_morlet_full", &cwt_morlet_full,
           py::arg("signal"),
@@ -456,19 +413,13 @@ PYBIND11_MODULE(cwt_module, m) {
           py::arg("max_freq") = 0.0,
           py::arg("use_omp") = false,
           py::arg("norm_mult") = 1.0,
-          py::arg("scale_type") = std::string("log-piecewise"),
           py::arg("consider_coi") = false,
           py::arg("return_fft") = false,
 R"doc(
 Compute the Morlet continuous wavelet transform (CWT) of a real 1D signal.
-Parameters:
-  - scale_type: one of {"log", "log-piecewise", "linear"}. 
-    "log": exponentially spaced scales,
-    "log-piecewise": exponential spacing with downsampling at high scales,
-    "linear": linearly spaced scales.
 Returns a tuple:
-  (W, scales, wavelet_freqs, psd_factor, fft_freqs[, coi]),
-where psd_factor = 4π/(C ω₀), computed numerically.
+  (W, scales, wavelet_freqs, psd_factor, fft_freqs[, coi]).
+psd_factor = 4π/(C ω₀), where C is computed numerically.
 )doc");
 
     m.def("local_gaussian_mean", &local_gaussian_mean,
@@ -482,6 +433,6 @@ Compute the local Gaussian mean of a signal (eqn(22)) with 3σ-window optimizati
 For each scale s and time index n, compute:
   B_n(s) = [ Σ_{m in window} B_m exp( - (t_n - t_m)^2/(2*lam^2*s^2) ) ]
            / [ Σ_{m in window} exp( - (t_n - t_m)^2/(2*lam^2*s^2) ) ]
-Returns an array of shape (num_scales, N, D) (or (num_scales, N) for 1D signals).
+Returns an array of shape (num_scales, N, D) (or (num_scales, N) for a 1D signal).
 )doc");
 }
