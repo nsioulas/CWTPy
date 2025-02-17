@@ -3,22 +3,20 @@
 //   1) cwt_morlet_full  : Morlet wavelet continuous wavelet transform (CWT)
 //   2) local_gaussian_mean : Local Gaussian mean (Equation (22)) with normalization
 //
-// This version supports user-specified scale distributions via a new parameter "scale_type".
+// This version supports user-specified scale distributions via the new parameter "scale_type".
 // Supported options include:
-//   - "log": Exponentially spaced scales.
-//   - "log-piecewise": Log spacing with downsampling at high scales.
+//   - "log": Exponentially spaced scales,
+//   - "log-piecewise": Exponential spacing with downsampling at high scales,
 //   - "linear": Linearly spaced scales.
-// (You can extend this list as needed.)
-// It uses FFTW_MEASURE for optimized planning and pre-creates all FFTW backward plans
-// so that the inner loops can be vectorized and executed in parallel without concurrent
-// plan creation/destruction issues.
+// It uses FFTW_MEASURE for planning and pre-creates FFTW backward plans so that the inner loops
+// can be vectorized and executed in parallel without concurrent plan creation/destruction issues.
 // 
 // IMPORTANT: To use FFTW’s OpenMP routines, compile and link against the FFTW OpenMP library 
 // (e.g. fftw3_omp). On macOS, install FFTW with OpenMP support (e.g. via Homebrew) and update your setup.py accordingly.
 // 
 // Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
 
-#include <Python.h>  // Must be included first!
+#include <Python.h>    // Must be included first!
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <fftw3.h>
@@ -114,8 +112,7 @@ static std::vector<double> generate_scales(double s0, double s1, int nv, const s
         return make_scales_log(s0, s1, nv);
     } else if (scale_type == "log-piecewise") {
         std::vector<double> full_scales = make_scales_log(s0, s1, nv);
-        // Downsample high scales to avoid redundancy.
-        double threshold = 1.05;  // if consecutive scales differ by less than 5%, drop extras.
+        double threshold = 1.05;  // downsample if consecutive scales differ by <5%
         std::vector<double> filtered;
         filtered.push_back(full_scales[0]);
         for (size_t i = 1; i < full_scales.size(); i++) {
@@ -124,7 +121,6 @@ static std::vector<double> generate_scales(double s0, double s1, int nv, const s
         }
         return filtered;
     } else if (scale_type == "linear") {
-        // Create linear spacing between s0 and s1.
         double octaves = std::log2(s1/s0);
         int count = std::max(2, (int)std::ceil(octaves * nv));
         std::vector<double> scales(count);
@@ -151,7 +147,7 @@ static std::vector<double> generate_scales(double s0, double s1, int nv, const s
      - W: CWT coefficients (num_scales x N)
      - scales: vector of scales (in seconds)
      - wave_freqs: corresponding wavelet frequencies (Hz)
-     - psd_factor = 4π/(C ω₀), with C computed numerically
+     - psd_factor = 4π/(C ω₀), computed numerically via Simpson's rule
      - fft_freqs: FFT frequencies (Hz)
      - coi: cone-of-influence (if requested)
      
@@ -202,7 +198,6 @@ py::tuple cwt_morlet_full(
     double smax = freq_to_scale(min_freq, omega0);
     if (smin >= smax)
         throw std::runtime_error("Scale range is invalid. Check freq bounds.");
-    // Use the user-specified scale distribution preset.
     std::vector<double> scales = generate_scales(smin, smax, nv, scale_type);
     int num_scales = static_cast<int>(scales.size());
 
@@ -223,7 +218,7 @@ py::tuple cwt_morlet_full(
     }
     fftw_free(out);
 
-    // Allocate container for CWT coefficients.
+    // Container for CWT coefficients.
     std::vector<std::complex<double>> W_data(num_scales * N);
 
     // Build angular frequency array.
@@ -235,7 +230,7 @@ py::tuple cwt_morlet_full(
     }
     double norm = morlet_factor() * norm_mult;
 
-    // Pre-create FFTW backward plans and associated buffers (serially).
+    // Pre-create FFTW backward plans and buffers (serially).
     std::vector<fftw_plan> bwd_plans(num_scales);
     std::vector<fftw_complex*> freq_prods(num_scales);
     std::vector<fftw_complex*> inv_buffers(num_scales);
@@ -336,11 +331,11 @@ py::tuple cwt_morlet_full(
 /*
    local_gaussian_mean:
    Computes the local Gaussian mean B_n(s) for each scale s and time index n:
-     B_n(s) = [ Σ_{m in window} B_m exp( - (t_n-t_m)^2/(2 lam^2 s^2) ) ]
-              / [ Σ_{m in window} exp( - (t_n-t_m)^2/(2 lam^2 s^2) ) ]
+     B_n(s) = [ Σ_{m in window} B_m exp( - (t_n - t_m)^2/(2 lam^2 s^2) ) ]
+              / [ Σ_{m in window} exp( - (t_n - t_m)^2/(2 lam^2 s^2) ) ]
    Only considers m for which |t_n - t_m| <= 3*lam*s.
    Assumes times is sorted in ascending order.
-   Returns an array of shape (num_scales, N, D) for a D-component signal (or (S,N) for 1D).
+   Returns an array of shape (num_scales, N, D) for a D-component signal (or (S, N) for 1D).
 */
 py::array_t<double> local_gaussian_mean(
     py::array_t<double> signal,
@@ -465,7 +460,7 @@ PYBIND11_MODULE(cwt_module, m) {
 R"doc(
 Compute the Morlet continuous wavelet transform (CWT) of a real 1D signal.
 Parameters:
-  - scale_type: one of {"log", "log-piecewise", "linear"}. 
+  - scale_type: one of {"log", "log-piecewise", "linear"}.
     "log": exponentially spaced scales,
     "log-piecewise": exponential spacing with downsampling at high scales,
     "linear": linearly spaced scales.
