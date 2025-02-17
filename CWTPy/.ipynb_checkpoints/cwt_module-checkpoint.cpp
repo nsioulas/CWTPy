@@ -3,13 +3,10 @@
 //   1) cwt_morlet_full  : Morlet wavelet CWT
 //   2) local_gaussian_mean : local Gaussian mean (Equation (22)) with normalization
 //
-// This version pre-creates FFTW backward plans for each scale (serially), then executes
-// them concurrently in an OpenMP parallel loop. This avoids the known issues with creating/destroying
-// FFTW plans concurrently on macOS with Clang+OpenMP.
-// 
-// IMPORTANT: To use FFTW's OpenMP threading, you must compile and link against the FFTW OpenMP library 
-// (e.g. fftw3_omp). On macOS, if you have difficulties, you may need to install FFTW with --enable-openmp
-// via Homebrew.
+// This version uses FFTW_MEASURE for planning and includes minor loop optimizations.
+// It pre-creates FFTW backward plans (using FFTW_MEASURE) and then executes them concurrently.
+// Further micro-optimizations (such as SIMD inner loops or FFT-based convolution for local averaging)
+// are possible but not shown here.
 // 
 // Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
 
@@ -40,7 +37,7 @@ static inline double morlet_factor() {
 static double compute_admissibility(double omega0) {
     const double eps = 1e-6;
     double upper = omega0 + 10.0;
-    const int nsteps = 100000;  // must be even
+    const int nsteps = 100000;  // must be even for Simpson's rule
     double h = (upper - eps) / nsteps;
     double sum = 0.0;
     for (int i = 0; i <= nsteps; i++) {
@@ -107,8 +104,14 @@ static std::vector<double> compute_fft_freqs(int N, double fs) {
    cwt_morlet_full:
    Computes the Morlet CWT of a real 1D signal.
    Returns a tuple:
-     (W, scales, wave_freqs, psd_factor, fft_freqs[, coi])
-   where psd_factor = 4π/(C ω₀) (C computed numerically).
+      (W, scales, wave_freqs, psd_factor, fft_freqs[, coi])
+   where:
+      - W is the array of CWT coefficients (num_scales x N)
+      - scales is the vector of scales (in seconds)
+      - wave_freqs are the corresponding wavelet frequencies (in Hz)
+      - psd_factor = 4π/(C ω₀), with C computed numerically
+      - fft_freqs are the FFT frequencies (in Hz)
+      - coi is the cone-of-influence (if requested)
 */
 py::tuple cwt_morlet_full(
     py::array_t<double> signal,
@@ -124,10 +127,9 @@ py::tuple cwt_morlet_full(
 ) {
 #ifdef _OPENMP
     if (use_omp) {
-        // Initialize FFTW's OpenMP support.
+        // Use FFTW_MEASURE to precompute optimized plans.
         if (!fftw_init_threads())
             throw std::runtime_error("fftw_init_threads() failed");
-        // Set number of threads for FFTW (use all available).
         int num_threads = omp_get_max_threads();
         fftw_plan_with_nthreads(num_threads);
     }
@@ -156,14 +158,14 @@ py::tuple cwt_morlet_full(
     std::vector<double> scales = make_scales_log(smin, smax, nv);
     int num_scales = static_cast<int>(scales.size());
 
-    // Forward FFT of signal.
+    // Forward FFT.
     fftw_complex* in  = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
     fftw_complex* out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
     for (int i = 0; i < N; i++) {
         in[i][0] = sig_ptr[i];
         in[i][1] = 0.0;
     }
-    fftw_plan plan_fwd = fftw_plan_dft_1d(N, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+    fftw_plan plan_fwd = fftw_plan_dft_1d(N, in, out, FFTW_FORWARD, FFTW_MEASURE);
     fftw_execute(plan_fwd);
     fftw_destroy_plan(plan_fwd);
     fftw_free(in);
@@ -185,17 +187,17 @@ py::tuple cwt_morlet_full(
     }
     double norm = morlet_factor() * norm_mult;
 
-    // ----- Pre-create FFTW backward plans for each scale (serially) -----
+    // Pre-create FFTW backward plans and associated buffers for each scale.
     std::vector<fftw_plan> bwd_plans(num_scales);
     std::vector<fftw_complex*> freq_prods(num_scales);
     std::vector<fftw_complex*> inv_buffers(num_scales);
     for (int sidx = 0; sidx < num_scales; sidx++) {
         freq_prods[sidx] = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
         inv_buffers[sidx] = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
-        bwd_plans[sidx] = fftw_plan_dft_1d(N, freq_prods[sidx], inv_buffers[sidx], FFTW_BACKWARD, FFTW_ESTIMATE);
+        bwd_plans[sidx] = fftw_plan_dft_1d(N, freq_prods[sidx], inv_buffers[sidx], FFTW_BACKWARD, FFTW_MEASURE);
     }
 
-    // ----- Parallel execution: fill buffers and execute plans concurrently -----
+    // Parallel execution: fill buffers and execute plans concurrently.
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static) if(use_omp)
 #endif
@@ -216,7 +218,7 @@ py::tuple cwt_morlet_full(
         }
     }
 
-    // Clean up FFTW backward plans.
+    // Cleanup: destroy plans and free buffers.
     for (int sidx = 0; sidx < num_scales; sidx++) {
         fftw_destroy_plan(bwd_plans[sidx]);
         fftw_free(freq_prods[sidx]);
@@ -290,7 +292,7 @@ py::tuple cwt_morlet_full(
               / [ Σ_{m in window} exp( - (t_n-t_m)^2/(2 lam^2 s^2) ) ]
    Only considers m for which |t_n - t_m| <= 3*lam*s.
    Assumes times is sorted in ascending order.
-   Returns an array of shape (S, N, D) for a D-component signal (or (S, N) for 1D).
+   Returns an array of shape (S, N, D) for a D-component signal (or (S,N) for 1D).
 */
 py::array_t<double> local_gaussian_mean(
     py::array_t<double> signal,
@@ -329,11 +331,11 @@ py::array_t<double> local_gaussian_mean(
 #ifdef _OPENMP
     if (use_omp) {
         #pragma omp parallel for schedule(dynamic)
-        for (int i = 0; i < S; i++) {
+        for (int i = 0; i < S; i++){
             double s = scale_ptr[i];
             double sigma = lam * s;
             double window = 3.0 * sigma;
-            for (int n = 0; n < N; n++) {
+            for (int n = 0; n < N; n++){
                 double tn = times_vec[n];
                 auto lb = std::lower_bound(times_vec.begin(), times_vec.end(), tn - window);
                 auto ub = std::upper_bound(times_vec.begin(), times_vec.end(), tn + window);
@@ -341,19 +343,19 @@ py::array_t<double> local_gaussian_mean(
                 int ub_idx = std::distance(times_vec.begin(), ub);
                 double sumW = 0.0;
                 std::vector<double> accum(D, 0.0);
-                for (int m = lb_idx; m < ub_idx; m++) {
+                for (int m = lb_idx; m < ub_idx; m++){
                     double dt_val = tn - times_vec[m];
                     double w = std::exp(- (dt_val * dt_val) / (2.0 * sigma * sigma));
                     sumW += w;
                     if (D == 1)
                         accum[0] += sig_ptr[m] * w;
                     else {
-                        for (int d = 0; d < D; d++) {
+                        for (int d = 0; d < D; d++){
                             accum[d] += sig_ptr[m * D + d] * w;
                         }
                     }
                 }
-                for (int d = 0; d < D; d++) {
+                for (int d = 0; d < D; d++){
                     accum[d] /= (sumW + 1e-30);
                     B_ptr[((i * N) + n) * D + d] = accum[d];
                 }
@@ -362,11 +364,11 @@ py::array_t<double> local_gaussian_mean(
     } else
 #endif
     {
-        for (int i = 0; i < S; i++) {
+        for (int i = 0; i < S; i++){
             double s = scale_ptr[i];
             double sigma = lam * s;
             double window = 3.0 * sigma;
-            for (int n = 0; n < N; n++) {
+            for (int n = 0; n < N; n++){
                 double tn = times_vec[n];
                 auto lb = std::lower_bound(times_vec.begin(), times_vec.end(), tn - window);
                 auto ub = std::upper_bound(times_vec.begin(), times_vec.end(), tn + window);
@@ -374,19 +376,19 @@ py::array_t<double> local_gaussian_mean(
                 int ub_idx = std::distance(times_vec.begin(), ub);
                 double sumW = 0.0;
                 std::vector<double> accum(D, 0.0);
-                for (int m = lb_idx; m < ub_idx; m++) {
+                for (int m = lb_idx; m < ub_idx; m++){
                     double dt_val = tn - times_vec[m];
                     double w = std::exp(- (dt_val * dt_val) / (2.0 * sigma * sigma));
                     sumW += w;
                     if (D == 1)
                         accum[0] += sig_ptr[m] * w;
                     else {
-                        for (int d = 0; d < D; d++) {
+                        for (int d = 0; d < D; d++){
                             accum[d] += sig_ptr[m * D + d] * w;
                         }
                     }
                 }
-                for (int d = 0; d < D; d++) {
+                for (int d = 0; d < D; d++){
                     accum[d] /= (sumW + 1e-30);
                     B_ptr[((i * N) + n) * D + d] = accum[d];
                 }
@@ -398,8 +400,8 @@ py::array_t<double> local_gaussian_mean(
 }
 
 PYBIND11_MODULE(cwt_module, m) {
-    m.doc() = "CWTPy: final single-file library with Morlet CWT and local Gaussian mean, avoiding fftw_init_threads for macOS stability.";
-
+    m.doc() = "CWTPy: final single-file library with Morlet CWT and local Gaussian mean, using pre-created FFTW OpenMP plans.";
+    
     m.def("cwt_morlet_full", &cwt_morlet_full,
           py::arg("signal"),
           py::arg("dt"),
