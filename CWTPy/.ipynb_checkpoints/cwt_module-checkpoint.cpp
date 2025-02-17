@@ -3,15 +3,10 @@
 //   1) cwt_morlet_full  : Morlet wavelet CWT
 //   2) local_gaussian_mean : local Gaussian mean (Equation (22)) with normalization
 //
-// This version pre-creates FFTW backward plans for each scale (serially),
-// then executes them concurrently in an OpenMP-parallel loop.
-// The inner loop over frequency indices is annotated with OpenMP SIMD pragmas.
-// This design avoids concurrent FFTW plan creation/destruction on macOS and 
-// should yield improved performance without changing results.
-// 
-// IMPORTANT: To use FFTW’s OpenMP routines, compile and link against the FFTW OpenMP library 
-// (e.g. fftw3_omp). On macOS, install FFTW with OpenMP support (e.g. via Homebrew)
-// and update your setup.py accordingly.
+// This version uses FFTW_MEASURE for planning and includes minor loop optimizations.
+// It pre-creates FFTW backward plans (using FFTW_MEASURE) and then executes them concurrently.
+// Further micro-optimizations (such as SIMD inner loops or FFT-based convolution for local averaging)
+// are possible but not shown here.
 // 
 // Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
 
@@ -107,16 +102,16 @@ static std::vector<double> compute_fft_freqs(int N, double fs) {
 //------------------------------------------------------------------------------
 /*
    cwt_morlet_full:
-   Computes the Morlet continuous wavelet transform (CWT) of a real 1D signal.
+   Computes the Morlet CWT of a real 1D signal.
    Returns a tuple:
-     (W, scales, wave_freqs, psd_factor, fft_freqs[, coi])
+      (W, scales, wave_freqs, psd_factor, fft_freqs[, coi])
    where:
-     - W: array of CWT coefficients (num_scales x N)
-     - scales: vector of scales (in seconds)
-     - wave_freqs: corresponding wavelet frequencies (Hz)
-     - psd_factor = 4π/(C ω₀), with C computed numerically
-     - fft_freqs: FFT frequencies (Hz)
-     - coi: cone-of-influence (if requested)
+      - W is the array of CWT coefficients (num_scales x N)
+      - scales is the vector of scales (in seconds)
+      - wave_freqs are the corresponding wavelet frequencies (in Hz)
+      - psd_factor = 4π/(C ω₀), with C computed numerically
+      - fft_freqs are the FFT frequencies (in Hz)
+      - coi is the cone-of-influence (if requested)
 */
 py::tuple cwt_morlet_full(
     py::array_t<double> signal,
@@ -132,6 +127,7 @@ py::tuple cwt_morlet_full(
 ) {
 #ifdef _OPENMP
     if (use_omp) {
+        // Use FFTW_MEASURE to precompute optimized plans.
         if (!fftw_init_threads())
             throw std::runtime_error("fftw_init_threads() failed");
         int num_threads = omp_get_max_threads();
@@ -185,13 +181,13 @@ py::tuple cwt_morlet_full(
     // Build angular frequency array.
     std::vector<double> omega_vec(N);
     double df_val = fs / double(N);
-    for (int k = 0; k < N; k++){
+    for (int k = 0; k < N; k++) {
         double f_k = (k <= N / 2) ? k * df_val : -(N - k) * df_val;
         omega_vec[k] = 2.0 * M_PI * f_k;
     }
     double norm = morlet_factor() * norm_mult;
 
-    // Pre-create FFTW backward plans and associated buffers (serially).
+    // Pre-create FFTW backward plans and associated buffers for each scale.
     std::vector<fftw_plan> bwd_plans(num_scales);
     std::vector<fftw_complex*> freq_prods(num_scales);
     std::vector<fftw_complex*> inv_buffers(num_scales);
@@ -207,27 +203,22 @@ py::tuple cwt_morlet_full(
 #endif
     for (int sidx = 0; sidx < num_scales; sidx++) {
         double s = scales[sidx];
-        double sqrt_s = std::sqrt(s); // precompute sqrt(s)
-        for (int k = 0; k < N; k++){
+        for (int k = 0; k < N; k++) {
             double arg = s * omega_vec[k] - omega0;
-            // Attach simd to the for-loop (not a block)
-            #pragma omp simd
-            for (int dummy = 0; dummy < 1; dummy++) { // dummy loop to attach simd
-                double wavelet = std::exp(-0.5 * arg * arg) * sqrt_s * norm;
-                std::complex<double> val = sig_fft[k] * wavelet;
-                freq_prods[sidx][k][0] = val.real();
-                freq_prods[sidx][k][1] = val.imag();
-            }
+            double wavelet = std::exp(-0.5 * arg * arg) * std::sqrt(s) * norm;
+            std::complex<double> val = sig_fft[k] * wavelet;
+            freq_prods[sidx][k][0] = val.real();
+            freq_prods[sidx][k][1] = val.imag();
         }
         fftw_execute(bwd_plans[sidx]);
-        for (int n = 0; n < N; n++){
+        for (int n = 0; n < N; n++) {
             double re = inv_buffers[sidx][n][0] / double(N);
             double im = inv_buffers[sidx][n][1] / double(N);
             W_data[sidx * N + n] = std::complex<double>(re, im);
         }
     }
 
-    // Clean up FFTW backward plans.
+    // Cleanup: destroy plans and free buffers.
     for (int sidx = 0; sidx < num_scales; sidx++) {
         fftw_destroy_plan(bwd_plans[sidx]);
         fftw_free(freq_prods[sidx]);
@@ -236,7 +227,7 @@ py::tuple cwt_morlet_full(
 
     // Compute wavelet frequencies (in Hz).
     std::vector<double> wave_freqs(num_scales);
-    for (int i = 0; i < num_scales; i++){
+    for (int i = 0; i < num_scales; i++) {
         wave_freqs[i] = scale_to_freq(scales[i], omega0);
     }
 
@@ -245,7 +236,7 @@ py::tuple cwt_morlet_full(
     double psd_factor = (4.0 * M_PI) / (C_val * omega0);
 
     // Convert outputs to Python arrays.
-    py::array_t<std::complex<double>> W_py({num_scales, N});
+    py::array_t<std::complex<double>> W_py({ num_scales, N });
     {
         auto W_buf = W_py.request();
         auto* W_ptr = (std::complex<double>*) W_buf.ptr;
@@ -258,7 +249,7 @@ py::tuple cwt_morlet_full(
         auto f_buf = freqs_py.request();
         double* s_ptr = (double*) s_buf.ptr;
         double* f_ptr = (double*) f_buf.ptr;
-        for (int i = 0; i < num_scales; i++){
+        for (int i = 0; i < num_scales; i++) {
             s_ptr[i] = scales[i];
             f_ptr[i] = wave_freqs[i];
         }
@@ -266,20 +257,20 @@ py::tuple cwt_morlet_full(
     py::array_t<double> fft_freqs_py(0);
     if (return_fft) {
         std::vector<double> fft_freqs = compute_fft_freqs(N, fs);
-        fft_freqs_py.resize({(size_t)N});
+        fft_freqs_py.resize({ (size_t)N });
         auto fft_buf = fft_freqs_py.request();
         double* ptr = (double*) fft_buf.ptr;
-        for (int i = 0; i < N; i++){
+        for (int i = 0; i < N; i++) {
             ptr[i] = fft_freqs[i];
         }
     }
     py::array_t<double> coi_py(0);
     if (consider_coi) {
         std::vector<double> coi = compute_coi(N, dt);
-        coi_py.resize({(size_t)N});
+        coi_py.resize({ (size_t)N });
         auto coi_buf = coi_py.request();
         double* cptr = (double*) coi_buf.ptr;
-        for (int i = 0; i < N; i++){
+        for (int i = 0; i < N; i++) {
             cptr[i] = coi[i];
         }
     }
@@ -301,7 +292,7 @@ py::tuple cwt_morlet_full(
               / [ Σ_{m in window} exp( - (t_n-t_m)^2/(2 lam^2 s^2) ) ]
    Only considers m for which |t_n - t_m| <= 3*lam*s.
    Assumes times is sorted in ascending order.
-   Returns an array of shape (num_scales, N, D) for a D-component signal (or (num_scales, N) for 1D).
+   Returns an array of shape (S, N, D) for a D-component signal (or (S,N) for 1D).
 */
 py::array_t<double> local_gaussian_mean(
     py::array_t<double> signal,
