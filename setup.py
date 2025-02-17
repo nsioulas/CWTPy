@@ -32,20 +32,31 @@ fftw_lib = os.environ.get("FFTW_LIB", fftw_lib_default)
 # ---------------------------
 # 3) Define the Extension with ABI3 Support
 # ---------------------------
+# module = Extension(
+#     "CWTPy.cwt_module",
+#     sources=["CWTPy/cwt_module.cpp"],
+#     include_dirs=[pybind11.get_include(), fftw_inc],
+#     libraries=["fftw3", "fftw3_threads"],
+#     library_dirs=[fftw_lib],
+#     extra_compile_args=extra_compile_args,  # Note: removed -DPy_LIMITED_API=0x03060000
+#     extra_link_args=extra_link_args,
+#     # Removed: py_limited_api=True
+# )
+
 module = Extension(
     "CWTPy.cwt_module",
     sources=["CWTPy/cwt_module.cpp"],
     include_dirs=[pybind11.get_include(), fftw_inc],
-    libraries=["fftw3", "fftw3_threads"],
+    libraries=["fftw3_omp"],  # Link against the OpenMP-enabled FFTW library.
     library_dirs=[fftw_lib],
-    extra_compile_args=extra_compile_args,  # Note: removed -DPy_LIMITED_API=0x03060000
+    extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
-    # Removed: py_limited_api=True
 )
+
 
 setup(
     name="CWTPy",
-    version="0.2.4",  # Update the version here
+    version="0.2.5",  # Update the version here
     description="A fast continuous wavelet transform (CWT) implementation using C++/FFTW/pybind11.",
     author="Nikos Sioulas",
     author_email="nsioulas@berkeley.edu",

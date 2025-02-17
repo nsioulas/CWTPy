@@ -1,80 +1,15 @@
 // CWTPy/cwt_module.cpp
-// CWTPy: A fast, cross‑platform continuous wavelet transform (CWT) implementation
-// using FFTW and optional OpenMP, with a user-specified normalization approach,
-// approximate COI, and FFT frequencies returned in Hz.
-//
-// This module computes the CWT using an L2‑normalized Morlet wavelet and returns:
-//    - W:         CWT coefficients (num_scales x N)
-//    - scales:    array of scales
-//    - freqs:     wavelet frequencies (Hz) mapped from those scales
-//    - psd_factor:  the partial PSD factor = (4π)/(C ω₀).  It's up to the user to
-//                   further divide by N, T, or #samples used in an averaging, as needed
-//                   
-//    - fft_freqs:  the FFT frequencies (Hz) for the input signal
-//    - coi:        approximate cone of influence (length N), if requested
-//
-
-//
-// Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
-
-// CWTPy/cwt_module.cpp
 // CWTPy: A single unified C++ module for:
 //   1) cwt_morlet_full  : Morlet wavelet CWT
 //   2) local_gaussian_mean : local Gaussian mean (Equation (22)) with normalization
 //
-// Both are exposed via Pybind11 in the same library.
-//
-// Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
-
-
-// CWTPy/cwt_module.cpp
-// CWTPy: A fast, cross‑platform continuous wavelet transform (CWT)
-// and local Gaussian mean library using FFTW and optional OpenMP,
-// with a user-specified normalization approach, approximate COI, and 
-// FFT frequencies returned in Hz.
-//
-// This module computes the CWT using an L2‑normalized Morlet wavelet and returns:
-//    - W:         CWT coefficients (num_scales x N)
-//    - scales:    array of scales
-//    - freqs:     wavelet frequencies (Hz) mapped from those scales
-//    - psd_factor: partial PSD factor = 4π/(C ω₀)
-//    - fft_freqs: FFT frequencies (Hz) for the input signal
-//    - coi:       approximate cone of influence (if requested)
-//
-// It also implements a local Gaussian mean (eqn(22)):
-//    B_n(s) = ( Σ_m B_m exp(- (t_n-t_m)²/(2*lam²*s²)) ) / ( Σ_m exp(- (t_n-t_m)²/(2*lam²*s²)) )
-//
-// For efficiency, the local Gaussian mean function restricts m to indices
-// with |t_n - t_m| <= 3 * lam * s using binary search.
-//
-// Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
-
-// CWTPy/cwt_module.cpp
-// CWTPy: A fast, cross‑platform continuous wavelet transform (CWT) implementation
-// using FFTW and optional OpenMP, with a user-specified normalization approach,
-// approximate COI, and FFT frequencies returned in Hz.
-//
-// This module computes the CWT using an L2‑normalized Morlet wavelet and returns:
-//    - W:         CWT coefficients (num_scales x N)
-//    - scales:    array of scales
-//    - freqs:     wavelet frequencies (Hz) mapped from those scales
-//    - psd_factor:  the partial PSD factor = (4π)/(C ω₀).  It's up to the user to
-//                   further divide by N, T, or #samples used in an averaging, as needed
-//                   
-//    - fft_freqs:  the FFT frequencies (Hz) for the input signal
-//    - coi:        approximate cone of influence (length N), if requested
-//
-
-//
-// Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
-
-// CWTPy/cwt_module.cpp
-// CWTPy: A single unified C++ module for:
-//   1) cwt_morlet_full  : Morlet wavelet CWT
-//   2) local_gaussian_mean : local Gaussian mean (Equation (22)) with normalization
-//
-// This version avoids crashes on macOS with OpenMP by serializing FFTW plan creation
-// and destruction using OpenMP critical sections. No FFTW internal threading is used.
+// This version pre-creates FFTW backward plans for each scale (serially), then executes
+// them concurrently in an OpenMP parallel loop. This avoids the known issues with creating/destroying
+// FFTW plans concurrently on macOS with Clang+OpenMP.
+// 
+// IMPORTANT: To use FFTW's OpenMP threading, you must compile and link against the FFTW OpenMP library 
+// (e.g. fftw3_omp). On macOS, if you have difficulties, you may need to install FFTW with --enable-openmp
+// via Homebrew.
 // 
 // Author: Nikos Sioulas (Space Sciences Laboratory, UC Berkeley)
 
@@ -172,8 +107,8 @@ static std::vector<double> compute_fft_freqs(int N, double fs) {
    cwt_morlet_full:
    Computes the Morlet CWT of a real 1D signal.
    Returns a tuple:
-      (W, scales, wave_freqs, psd_factor, fft_freqs[, coi])
-   where psd_factor = 4π/(C ω₀), with C computed numerically.
+     (W, scales, wave_freqs, psd_factor, fft_freqs[, coi])
+   where psd_factor = 4π/(C ω₀) (C computed numerically).
 */
 py::tuple cwt_morlet_full(
     py::array_t<double> signal,
@@ -187,6 +122,17 @@ py::tuple cwt_morlet_full(
     bool consider_coi,
     bool return_fft
 ) {
+#ifdef _OPENMP
+    if (use_omp) {
+        // Initialize FFTW's OpenMP support.
+        if (!fftw_init_threads())
+            throw std::runtime_error("fftw_init_threads() failed");
+        // Set number of threads for FFTW (use all available).
+        int num_threads = omp_get_max_threads();
+        fftw_plan_with_nthreads(num_threads);
+    }
+#endif
+
     auto buf = signal.request();
     if (buf.ndim != 1)
         throw std::runtime_error("signal must be 1D");
@@ -227,7 +173,7 @@ py::tuple cwt_morlet_full(
     }
     fftw_free(out);
 
-    // Allocate container for CWT coefficients.
+    // Container for CWT coefficients.
     std::vector<std::complex<double>> W_data(num_scales * N);
 
     // Build angular frequency array.
@@ -239,69 +185,42 @@ py::tuple cwt_morlet_full(
     }
     double norm = morlet_factor() * norm_mult;
 
-    // Parallelize over scales using OpenMP.
+    // ----- Pre-create FFTW backward plans for each scale (serially) -----
+    std::vector<fftw_plan> bwd_plans(num_scales);
+    std::vector<fftw_complex*> freq_prods(num_scales);
+    std::vector<fftw_complex*> inv_buffers(num_scales);
+    for (int sidx = 0; sidx < num_scales; sidx++) {
+        freq_prods[sidx] = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
+        inv_buffers[sidx] = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
+        bwd_plans[sidx] = fftw_plan_dft_1d(N, freq_prods[sidx], inv_buffers[sidx], FFTW_BACKWARD, FFTW_ESTIMATE);
+    }
+
+    // ----- Parallel execution: fill buffers and execute plans concurrently -----
 #ifdef _OPENMP
-    if (use_omp) {
-        #pragma omp parallel for schedule(static)
-        for (int sidx = 0; sidx < num_scales; sidx++) {
-            // For thread safety, serialize plan creation/destruction.
-            fftw_complex* freq_prod_local;
-            fftw_complex* inv_local;
-            fftw_plan plan_bwd_local;
-            #pragma omp critical
-            {
-                freq_prod_local = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
-                inv_local = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
-                plan_bwd_local = fftw_plan_dft_1d(N, freq_prod_local, inv_local, FFTW_BACKWARD, FFTW_ESTIMATE);
-            }
-            double s = scales[sidx];
-            for (int k = 0; k < N; k++) {
-                double arg = s * omega_vec[k] - omega0;
-                double wavelet = std::exp(-0.5 * arg * arg) * std::sqrt(s) * norm;
-                std::complex<double> val = sig_fft[k] * wavelet;
-                // No race here since freq_prod_local is private to the thread.
-                freq_prod_local[k][0] = val.real();
-                freq_prod_local[k][1] = val.imag();
-            }
-            fftw_execute(plan_bwd_local);
-            for (int n = 0; n < N; n++) {
-                double re = inv_local[n][0] / double(N);
-                double im = inv_local[n][1] / double(N);
-                W_data[sidx * N + n] = std::complex<double>(re, im);
-            }
-            #pragma omp critical
-            {
-                fftw_destroy_plan(plan_bwd_local);
-                fftw_free(freq_prod_local);
-                fftw_free(inv_local);
-            }
-        }
-    } else
+    #pragma omp parallel for schedule(static) if(use_omp)
 #endif
-    {
-        // Non-OpenMP version.
-        fftw_complex* freq_prod = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
-        fftw_complex* inv = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
-        fftw_plan plan_bwd = fftw_plan_dft_1d(N, freq_prod, inv, FFTW_BACKWARD, FFTW_ESTIMATE);
-        for (int sidx = 0; sidx < num_scales; sidx++) {
-            double s = scales[sidx];
-            for (int k = 0; k < N; k++) {
-                double arg = s * omega_vec[k] - omega0;
-                double wavelet = std::exp(-0.5 * arg * arg) * std::sqrt(s) * norm;
-                std::complex<double> val = sig_fft[k] * wavelet;
-                freq_prod[k][0] = val.real();
-                freq_prod[k][1] = val.imag();
-            }
-            fftw_execute(plan_bwd);
-            for (int n = 0; n < N; n++) {
-                double re = inv[n][0] / double(N);
-                double im = inv[n][1] / double(N);
-                W_data[sidx * N + n] = std::complex<double>(re, im);
-            }
+    for (int sidx = 0; sidx < num_scales; sidx++) {
+        double s = scales[sidx];
+        for (int k = 0; k < N; k++) {
+            double arg = s * omega_vec[k] - omega0;
+            double wavelet = std::exp(-0.5 * arg * arg) * std::sqrt(s) * norm;
+            std::complex<double> val = sig_fft[k] * wavelet;
+            freq_prods[sidx][k][0] = val.real();
+            freq_prods[sidx][k][1] = val.imag();
         }
-        fftw_destroy_plan(plan_bwd);
-        fftw_free(freq_prod);
-        fftw_free(inv);
+        fftw_execute(bwd_plans[sidx]);
+        for (int n = 0; n < N; n++) {
+            double re = inv_buffers[sidx][n][0] / double(N);
+            double im = inv_buffers[sidx][n][1] / double(N);
+            W_data[sidx * N + n] = std::complex<double>(re, im);
+        }
+    }
+
+    // Clean up FFTW backward plans.
+    for (int sidx = 0; sidx < num_scales; sidx++) {
+        fftw_destroy_plan(bwd_plans[sidx]);
+        fftw_free(freq_prods[sidx]);
+        fftw_free(inv_buffers[sidx]);
     }
 
     // Compute wavelet frequencies (in Hz).
@@ -310,7 +229,7 @@ py::tuple cwt_morlet_full(
         wave_freqs[i] = scale_to_freq(scales[i], omega0);
     }
 
-    // Partial PSD factor: 4π/(C ω₀).
+    // Partial PSD factor: 4π/(C ω₀)
     double C_val = compute_admissibility(omega0);
     double psd_factor = (4.0 * M_PI) / (C_val * omega0);
 
@@ -333,8 +252,6 @@ py::tuple cwt_morlet_full(
             f_ptr[i] = wave_freqs[i];
         }
     }
-
-    // FFT frequencies (in Hz).
     py::array_t<double> fft_freqs_py(0);
     if (return_fft) {
         std::vector<double> fft_freqs = compute_fft_freqs(N, fs);
@@ -345,8 +262,6 @@ py::tuple cwt_morlet_full(
             ptr[i] = fft_freqs[i];
         }
     }
-
-    // Cone of influence (if requested).
     py::array_t<double> coi_py(0);
     if (consider_coi) {
         std::vector<double> coi = compute_coi(N, dt);
@@ -375,7 +290,7 @@ py::tuple cwt_morlet_full(
               / [ Σ_{m in window} exp( - (t_n-t_m)^2/(2 lam^2 s^2) ) ]
    Only considers m for which |t_n - t_m| <= 3*lam*s.
    Assumes times is sorted in ascending order.
-   Returns an array of shape (S, N, D) for a D-component signal (or (S,N) for 1D).
+   Returns an array of shape (S, N, D) for a D-component signal (or (S, N) for 1D).
 */
 py::array_t<double> local_gaussian_mean(
     py::array_t<double> signal,
@@ -402,7 +317,7 @@ py::array_t<double> local_gaussian_mean(
     const double* time_ptr = static_cast<const double*>(time_buf.ptr);
     const double* scale_ptr = static_cast<const double*>(scale_buf.ptr);
 
-    // Copy times into vector for binary search
+    // Copy times into vector for binary search.
     std::vector<double> times_vec(time_ptr, time_ptr + N);
 
     // Output shape: (S, N, D)
@@ -484,7 +399,7 @@ py::array_t<double> local_gaussian_mean(
 
 PYBIND11_MODULE(cwt_module, m) {
     m.doc() = "CWTPy: final single-file library with Morlet CWT and local Gaussian mean, avoiding fftw_init_threads for macOS stability.";
-    
+
     m.def("cwt_morlet_full", &cwt_morlet_full,
           py::arg("signal"),
           py::arg("dt"),
